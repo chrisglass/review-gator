@@ -2,6 +2,7 @@
 
 import datetime
 import os
+import platform
 import shutil
 import socket
 import sys
@@ -14,6 +15,7 @@ import pytz
 import yaml
 
 from babel.dates import format_datetime
+from configparser import ConfigParser
 from jinja2 import Environment, FileSystemLoader
 from pkg_resources import resource_filename
 
@@ -479,8 +481,38 @@ def get_sources(source):
     return data
 
 
+def send_riemann_event(repo_count):
+    '''Send an even to Riemann via the bernhard library if is is installed.'''
+    try:
+        import bernhard
+    except ImportError:
+        print("Cannot use --riemann-reporting if bernhard is not installed. "
+              "Try 'pip install bernhard'")
+        sys.exit(1)
+
+    conf = ConfigParser()
+    conf.read(("/etc/bernhard.conf",))
+
+    riemann = conf.get('default', 'riemann_server')
+    client = bernhard.SSLClient(host=riemann,
+                                port=int(conf.get('default', 'riemann_port')),
+                                keyfile=conf.get('default', 'tls_cert_key'),
+                                certfile=conf.get('default', 'tls_cert'),
+                                ca_certs=conf.get('default', 'tls_ca_cert'))
+    event = {
+        'host': platform.node(),
+        'service': 'review queue',
+        'state': 'ok',
+        'metric': repo_count,
+        'description': 'review queue depth',
+        'ttl': 3700,
+        'tags': ['review', 'process']}
+
+    print('Reporting queue depth of %d to Riemann (%s)' % (repo_count, riemann))
+    client.send(event)
+
 def aggregate_reviews(sources, output_directory, github_password, github_token,
-                      github_username):
+                      github_username, riemann_reporting):
     try:
         repos = []
         if 'lp-git' in sources:
@@ -493,6 +525,8 @@ def aggregate_reviews(sources, output_directory, github_password, github_token,
             repos.extend(get_repos(sources['github'],
                                    github_username, github_password, github_token))
         render(repos, output_directory)
+        if riemann_reporting:
+            send_riemann_event(len(repos))
         last_poll = format_datetime(pytz.utc.localize(datetime.datetime.utcnow()))
         print("Last run @ {}".format(last_poll))
     except socket.timeout as se:
@@ -524,6 +558,9 @@ def aggregate_reviews(sources, output_directory, github_password, github_token,
                            " When using the review-gator snap this config "
                            "must reside under $HOME."
                            if os.environ.get('SNAP', None) else ""))
+@click.option('--riemann-reporting', is_flag=True, default=False,
+              help='Should the queue size be reported to Riemann using '
+                   'bernhard?')
 @click.option('--github-username', envvar='GITHUB_USERNAME', required=False,
               help="Your github username."
                    "You can also set GITHUB_USERNAME as an environment "
@@ -542,7 +579,7 @@ def aggregate_reviews(sources, output_directory, github_password, github_token,
 @click.option('--poll-interval', type=int, required=False, default=600,
               help="Interval, in seconds, between each version check "
                    "[default: 600 seconds]")
-def main(config_skeleton, config, output_directory,
+def main(config_skeleton, config, output_directory, riemann_reporting,
          github_username, github_password, github_token, poll, poll_interval):
     """Start here."""
     global NOW
@@ -558,7 +595,7 @@ def main(config_skeleton, config, output_directory,
 
     sources = get_sources(config)
     aggregate_reviews(sources, output_directory, github_password,
-                      github_token, github_username)
+                      github_token, github_username, riemann_reporting)
 
     if poll:
         # We do use time.sleep which is blocking so it is best to 'nice'
